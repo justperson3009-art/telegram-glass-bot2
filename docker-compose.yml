@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  erudit-bot:
+    build: .
+    container_name: erudit_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - erudit_network
+
+networks:
+  erudit_network:
+    driver: bridge
