@@ -21,6 +21,7 @@ from game_logic import (
     GameBoard, TileBag, LETTER_POINTS,
     generate_initial_tiles, refill_tiles, check_game_end
 )
+from bot_opponent import BotOpponent
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -52,8 +53,9 @@ class GameState(StatesGroup):
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     """Главное меню"""
     kb = [
-        [KeyboardButton(text="🎮 Новая игра"), KeyboardButton(text="📊 Рейтинг")],
-        [KeyboardButton(text="📈 Моя статистика"), KeyboardButton(text="❓ Помощь")]
+        [KeyboardButton(text="🎮 Новая игра"), KeyboardButton(text="🤖 Игра с ботом")],
+        [KeyboardButton(text="📊 Рейтинг"), KeyboardButton(text="📈 Моя статистика")],
+        [KeyboardButton(text="❓ Помощь")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -76,6 +78,17 @@ def get_search_opponent_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="👤 По нику", callback_data="search_nickname")
     builder.button(text="🔙 Назад", callback_data="back_menu")
     builder.adjust(1, 1)
+    return builder.as_markup()
+
+
+def get_bot_difficulty_keyboard() -> InlineKeyboardMarkup:
+    """Выбор сложности бота"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🟢 Лёгкий (3 мин)", callback_data="bot_easy_180")
+    builder.button(text="🟡 Средний (5 мин)", callback_data="bot_medium_300")
+    builder.button(text="🔴 Сложный (10 мин)", callback_data="bot_hard_600")
+    builder.button(text="🔙 Назад", callback_data="back_menu")
+    builder.adjust(1, 1, 1)
     return builder.as_markup()
 
 
@@ -198,13 +211,34 @@ async def new_game_menu(message: Message, state: FSMContext):
             "Завершите её перед началом новой."
         )
         return
-    
+
     await state.set_state(GameState.choosing_mode)
     await message.answer(
         "🎮 **Выберите режим игры:**\n\n"
         "⏱️ **Блиц** — больше слов за отведённое время\n"
         "📝 **На очки** — игра до набора 1000 очков",
         reply_markup=get_mode_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.message(F.text == "🤖 Игра с ботом")
+async def play_with_bot(message: Message, state: FSMContext):
+    """Игра с ботом"""
+    # Проверка активной игры
+    active_game = await db.get_active_game(message.from_user.id)
+    if active_game and active_game.status == GameStatus.ACTIVE:
+        await message.answer(
+            "⚠️ У вас уже есть активная игра!\n"
+            "Завершите её перед началом новой."
+        )
+        return
+
+    await state.set_state(GameState.choosing_time)
+    await message.answer(
+        "🤖 **Игра с ботом**\n\n"
+        "Выберите сложность и время:",
+        reply_markup=get_bot_difficulty_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -284,23 +318,88 @@ async def mode_selected(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     mode_name = parts[1]
     time_limit = int(parts[2]) if len(parts) > 2 else 0
-    
+
     mode_map = {
         "time_words": GameMode.TIME_WORDS,
         "time_points": GameMode.TIME_POINTS,
         "points_only": GameMode.POINTS_ONLY
     }
-    
+
     mode = mode_map.get(mode_name, GameMode.TIME_WORDS)
-    
+
+    logger.info(f"Игрок {callback.from_user.id} выбрал режим: {mode_name}, время: {time_limit}")
+
     # Сохраняем выбор в состоянии
     await state.update_data(mode=mode.value, time_limit=time_limit)
     await state.set_state(GameState.searching)
-    
+
+    try:
+        await callback.message.edit_text(
+            "🔍 **Поиск соперника**\n\n"
+            "Выберите способ поиска:",
+            reply_markup=get_search_opponent_keyboard(),
+            parse_mode="Markdown"
+        )
+        logger.info(f"Отправлено сообщение с выбором поиска для {callback.from_user.id}")
+    except Exception as e:
+        logger.error(f"Ошибка при edit_text: {e}")
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("bot_"))
+async def bot_difficulty_selected(callback: CallbackQuery, state: FSMContext):
+    """Выбрана сложность бота"""
+    parts = callback.data.split("_")
+    difficulty = parts[1]
+    time_limit = int(parts[2]) if len(parts) > 2 else 300
+
+    # Создаём игру с ботом
+    player = await db.get_or_create_player(
+        callback.from_user.id,
+        callback.from_user.username or "",
+        callback.from_user.first_name or "Игрок"
+    )
+
+    # Создаём "бота" как второго игрока
+    bot_player = await db.get_or_create_player(
+        telegram_id=999999999,  # Специальный ID для бота
+        username="erudit_bot",
+        first_name="🤖 Бот"
+    )
+
+    game = await db.create_game(
+        player.id,
+        bot_player.id,
+        GameMode.PLAYER_VS_BOT,
+        time_limit
+    )
+
+    # Генерируем начальные буквы
+    tiles1, tiles2 = generate_initial_tiles()
+    game.player1_tiles = "".join(tiles1)
+    game.player2_tiles = "".join(tiles2)
+    game.current_turn = player.telegram_id  # Игрок ходит первым
+    game.started_at = datetime.now().isoformat()
+
+    if time_limit > 0:
+        game.time_remaining = time_limit
+
+    await db.update_game(game)
+
+    # Сохраняем сложность бота в состоянии (для использования в ходах бота)
+    await state.update_data(
+        bot_difficulty=difficulty,
+        game_id=game.id
+    )
+    await state.set_state(GameState.playing)
+
     await callback.message.edit_text(
-        "🔍 **Поиск соперника**\n\n"
-        "Выберите способ поиска:",
-        reply_markup=get_search_opponent_keyboard(),
+        f"🤖 **Игра с ботом началась!**\n\n"
+        f"Сложность: {difficulty}\n"
+        f"Ваш соперник: 🤖 Бот\n\n"
+        f"Ваши буквы: {' '.join(t.upper() for t in tiles1)}\n\n"
+        f"➡️ **Ваш ход!**",
+        reply_markup=get_game_keyboard(game, callback.from_user.id),
         parse_mode="Markdown"
     )
 
@@ -733,6 +832,109 @@ async def place_word_input(message: Message, state: FSMContext):
         )
     except Exception as e:
         logger.error(f"Не удалось уведомить соперника: {e}")
+
+    # Если игра с ботом и сейчас ход бота - делаем ход бота
+    if game.mode == "player_vs_bot" and opponent.telegram_id == 999999999:
+        await asyncio.sleep(1.5)  # Небольшая задержка для естественности
+        await make_bot_move(message.bot, game, state)
+
+
+async def make_bot_move(bot: Bot, game: Game, state: FSMContext):
+    """Сделать ход бота"""
+    try:
+        # Получаем данные бота
+        state_data = await state.get_data()
+        difficulty = state_data.get("bot_difficulty", "medium")
+
+        # Создаём бота
+        bot_opponent = BotOpponent(difficulty)
+
+        # Загружаем слова из БД
+        cursor = await db._connection.execute("SELECT word FROM words")
+        rows = await cursor.fetchall()
+        words = [r[0] for r in rows]
+        bot_opponent.load_words(words)
+
+        # Получаем поле и буквы бота
+        board = GameBoard.from_json(game.board)
+        bot_tiles = list(game.player2_tiles)
+
+        # Первый ли ход (если у бота 0 очков и у игрока 0 очков)
+        is_first_move = game.player2_score == 0 and game.player1_score == 0
+
+        # Ищем лучший ход
+        placed = bot_opponent.find_best_move(bot_tiles, board, is_first_move)
+
+        if not placed:
+            # Бот не может сделать ход - пропускаем
+            await bot.send_message(
+                game.player1_id,
+                "🤖 **Бот пропускает ход**\n\n"
+                "Не нашёл подходящего слова.\n\n"
+                "➡️ **Ваш ход!**",
+                parse_mode="Markdown"
+            )
+
+            # Возвращаем ход игроку
+            game.current_turn = game.player1_id
+            await db.update_game(game)
+            return
+
+        # Размещаем слово
+        board.place_word(placed)
+
+        # Обновляем счёт бота
+        game.player2_score += placed.points
+        game.player2_words += 1
+
+        # Обновляем буквы бота
+        new_tiles = list(bot_tiles)
+        for _, _, letter in placed.new_letters:
+            if letter in new_tiles:
+                new_tiles.remove(letter)
+
+        bag = TileBag()
+        new_tiles = refill_tiles(bag, new_tiles)
+        game.player2_tiles = "".join(new_tiles)
+
+        # Сохраняем поле
+        game.board = board.to_json()
+
+        # Добавляем ход в историю
+        bot_player = await db.get_player_by_id(game.player2_id)
+        await db.add_move(game.id, bot_player.id, placed.word, placed.points)
+
+        # Проверяем окончание игры
+        winner = check_game_end(board, bag, list(game.player1_tiles), new_tiles)
+
+        if winner:
+            game.status = GameStatus.FINISHED
+            game.finished_at = datetime.now().isoformat()
+            game.winner_id = 1 if winner == 1 else 2
+
+        # Передаём ход игроку
+        game.current_turn = game.player1_id
+
+        await db.update_game(game)
+
+        # Отправляем результат игроку
+        await bot.send_message(
+            game.player1_id,
+            f"🤖 **Бот сделал ход!**\n\n"
+            f"Слово: **{placed.word.upper()}**\n"
+            f"Очки: {placed.points}\n\n"
+            f"👤 Вы: {game.player1_score} оч.\n"
+            f"🤖 Бот: {game.player2_score} оч.\n\n"
+            f"{'🎉 Победа!' if winner and winner == 1 else '➡️ Ваш ход!' if not winner else '🤖 Бот победил!'}",
+            reply_markup=get_game_keyboard(game, game.player1_id) if not winner else None,
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при ходе бота: {e}")
+        # При ошибке просто передаём ход игроку
+        game.current_turn = game.player1_id
+        await db.update_game(game)
 
 
 @router.callback_query(F.data == "action_refresh")
