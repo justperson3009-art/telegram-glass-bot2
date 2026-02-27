@@ -1,7 +1,6 @@
 """
-Telegram бот Эрудит - PvP игра в слова
+Бот психологической поддержки
 """
-import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -11,41 +10,24 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardButton, 
+    Message, CallbackQuery, InlineKeyboardButton,
     InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from database import db, Player, Game, GameMode, GameStatus
-from game_logic import (
-    GameBoard, TileBag, LETTER_POINTS,
-    generate_initial_tiles, refill_tiles, check_game_end
-)
-from bot_opponent import BotOpponent
+from database import db
+from exercises import get_all_exercises, format_exercise, EXERCISES
+from quotes import get_random_quote, get_support_message, get_quote_by_mood
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Единый роутер для всех хендлеров
 router = Router()
 
-# Алиасы для совместимости
-main_router = router
-game_router = router
-search_router = router
 
-
-# === States ===
-class GameState(StatesGroup):
-    """Состояния FSM"""
-    menu = State()
-    searching = State()
-    waiting_for_nickname = State()
-    choosing_mode = State()
-    choosing_time = State()
-    playing = State()
-    placing_word = State()
+class MoodState(StatesGroup):
+    waiting_for_mood = State()
+    waiting_for_note = State()
 
 
 # === Клавиатуры ===
@@ -53,124 +35,54 @@ class GameState(StatesGroup):
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     """Главное меню"""
     kb = [
-        [KeyboardButton(text="🎮 Новая игра"), KeyboardButton(text="🤖 Игра с ботом")],
-        [KeyboardButton(text="📊 Рейтинг"), KeyboardButton(text="📈 Моя статистика")],
-        [KeyboardButton(text="❓ Помощь")]
+        [KeyboardButton(text="😊 Как я себя чувствую"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="🧘 Упражнения"), KeyboardButton(text="📝 Трекер привычек")],
+        [KeyboardButton(text="💬 Поддержка"), KeyboardButton(text="❓ Помощь")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 
-def get_mode_keyboard() -> InlineKeyboardMarkup:
-    """Выбор режима игры"""
+def get_mood_keyboard() -> InlineKeyboardMarkup:
+    """Выбор настроения"""
     builder = InlineKeyboardBuilder()
-    builder.button(text="⏱️ Блиц (3 мин)", callback_data="mode_time_words_180")
-    builder.button(text="🕐 Классика (10 мин)", callback_data="mode_time_words_600")
-    builder.button(text="📝 На очки (до 1000)", callback_data="mode_points_only_0")
-    builder.button(text="🔙 Назад", callback_data="back_menu")
-    builder.adjust(1, 1, 1)
+    emojis = ["😢", "😟", "😐", "🙂", "😊", "😄", "🤩"]
+    for i in range(1, 8):
+        builder.button(text=f"{emojis[i-1]} {i}", callback_data=f"mood_{i}")
+    builder.adjust(7)
     return builder.as_markup()
 
 
-def get_search_opponent_keyboard() -> InlineKeyboardMarkup:
-    """Выбор способа поиска соперника"""
+def get_exercises_keyboard() -> InlineKeyboardMarkup:
+    """Список упражнений"""
     builder = InlineKeyboardBuilder()
-    builder.button(text="🎲 Случайный соперник", callback_data="search_random")
-    builder.button(text="👤 По нику", callback_data="search_nickname")
+    for ex_id, ex_data in EXERCISES.items():
+        builder.button(text=ex_data['name'], callback_data=f"ex_{ex_id}")
+    builder.adjust(1)
+    builder.button(text="🔙 Назад", callback_data="back_menu")
+    return builder.as_markup()
+
+
+def get_habits_keyboard(habits: list) -> InlineKeyboardMarkup:
+    """Список привычек"""
+    builder = InlineKeyboardBuilder()
+    for habit in habits:
+        status = "✅" if habit.completed_today else "⬜"
+        builder.button(text=f"{status} {habit.name}", callback_data=f"habit_{habit.id}")
+    builder.button(text="➕ Добавить привычку", callback_data="habit_add")
+    builder.button(text="🔙 Назад", callback_data="back_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_support_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура поддержки"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💙 Получить поддержку", callback_data="support_message")
+    builder.button(text="📖 Мотивационная цитата", callback_data="quote")
+    builder.button(text="🧘 Дыхательное упражнение", callback_data="exercises")
     builder.button(text="🔙 Назад", callback_data="back_menu")
     builder.adjust(1, 1)
     return builder.as_markup()
-
-
-def get_bot_difficulty_keyboard() -> InlineKeyboardMarkup:
-    """Выбор сложности бота"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🟢 Лёгкий (3 мин)", callback_data="bot_easy_180")
-    builder.button(text="🟡 Средний (5 мин)", callback_data="bot_medium_300")
-    builder.button(text="🔴 Сложный (10 мин)", callback_data="bot_hard_600")
-    builder.button(text="🔙 Назад", callback_data="back_menu")
-    builder.adjust(1, 1, 1)
-    return builder.as_markup()
-
-
-def get_game_keyboard(game: Game, player_telegram_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура во время игры"""
-    builder = InlineKeyboardBuilder()
-    
-    is_my_turn = game.current_turn == player_telegram_id
-    
-    # Кнопки действий
-    if is_my_turn:
-        builder.button(text="📝 Сделать ход", callback_data="action_make_move")
-        builder.button(text="🔄 Обменять буквы", callback_data="action_exchange")
-        builder.button(text="⏭️ Пропустить ход", callback_data="action_pass")
-    else:
-        builder.button(text="🔄 Обновить", callback_data="action_refresh")
-    
-    # Кнопки управления
-    builder.button(text="💬 Чат", callback_data="action_chat")
-    builder.button(text="📋 История", callback_data="action_history")
-    builder.button(text="❌ Сдаться", callback_data="action_surrender")
-    
-    builder.adjust(3, 2, 1)
-    return builder.as_markup()
-
-
-def get_tiles_keyboard(tiles: list, prefix: str = "tile_") -> InlineKeyboardMarkup:
-    """Клавиатура с буквами"""
-    builder = InlineKeyboardBuilder()
-    
-    for i, tile in enumerate(tiles):
-        points = LETTER_POINTS.get(tile.lower(), 1)
-        builder.button(text=f"{tile.upper()}[{points}]", callback_data=f"{prefix}{i}_{tile}")
-    
-    builder.button(text="✅ Готово", callback_data=f"{prefix}done")
-    builder.button(text="❌ Отмена", callback_data=f"{prefix}cancel")
-    builder.adjust(7, 7, 2)
-    return builder.as_markup()
-
-
-def get_board_preview(board: GameBoard) -> str:
-    """Текстовое превью поля"""
-    display = board.get_display()
-    
-    # Нумерация колонок
-    header = "   " + " ".join(f"{i:2}" for i in range(15)) + "\n"
-    header += "   " + "─" * 44 + "\n"
-    
-    rows = ""
-    for i, row in enumerate(display):
-        rows += f"{i:2} │" + " ".join(f"{c:2}" for c in row) + "│\n"
-    
-    return header + rows
-
-
-def get_game_status_text(game: Game, player1: Player, player2: Player, 
-                          current_player_id: int) -> str:
-    """Текст статуса игры"""
-    mode_names = {
-        GameMode.TIME_WORDS: "⏱️ Блиц (больше слов за время)",
-        GameMode.TIME_POINTS: "⏱️ Блиц (больше очков за время)",
-        GameMode.POINTS_ONLY: "📝 На очки (до 1000)"
-    }
-    
-    time_str = ""
-    if game.time_limit > 0:
-        mins = game.time_remaining // 60
-        secs = game.time_remaining % 60
-        time_str = f"\n⏰ Время: {mins}:{secs:02d}"
-    
-    turn_emoji = "➡️" if game.current_turn == current_player_id else "⏳"
-    
-    text = f"""
-{mode_names.get(game.mode, "Игра")}
-{time_str}
-
-👤 {player1.first_name}: {game.player1_score} оч. | {game.player1_words} слов
-👤 {player2.first_name}: {game.player2_score} оч. | {game.player2_words} слов
-
-{turn_emoji} Ход: {'Ваш' if game.current_turn == current_player_id else 'Соперника'}
-"""
-    return text.strip()
 
 
 # === Хендлеры ===
@@ -178,105 +90,288 @@ def get_game_status_text(game: Game, player1: Player, player2: Player,
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     """Команда /start"""
-    player = await db.get_or_create_player(
+    user_id = await db.get_or_create_user(
         message.from_user.id,
         message.from_user.username or "",
-        message.from_user.first_name or "Игрок"
+        message.from_user.first_name or "Друг"
     )
-    
-    await state.set_state(GameState.menu)
-    
+
+    await state.set_state(None)
+
     await message.answer(
-        f"👋 Привет, {player.first_name}!\n\n"
-        "Добро пожаловать в **Эрудит** — игру слов!\n\n"
-        "📚 **Правила:**\n"
-        "• Составляйте слова из букв на поле 15x15\n"
-        "• Каждая буква имеет свою стоимость\n"
-        "• Премиум-клетки умножают очки\n"
-        "• Побеждает набравший больше очков/слов\n\n"
-        "Выберите действие в меню:",
+        f"💙 **Привет, {message.from_user.first_name}!**\n\n"
+        "Я — бот психологической поддержки. Я здесь, чтобы помочь тебе:\n\n"
+        "• 📊 **Отслеживать настроение** — записывай, как ты себя чувствуешь\n"
+        "• 🧘 **Делать упражнения** — дыхательные техники для успокоения\n"
+        "• 📝 **Вести привычки** — забота о себе каждый день\n"
+        "• 💬 **Получать поддержку** — мотивация и добрые слова\n\n"
+        "Помни: ты не один(на). Ты важен(на). Ты справишься.\n\n"
+        "Выбери, что хочешь сделать:",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
 
 
-@router.message(F.text == "🎮 Новая игра")
-async def new_game_menu(message: Message, state: FSMContext):
-    """Меню новой игры"""
-    # Проверка активной игры
-    active_game = await db.get_active_game(message.from_user.id)
-    if active_game and active_game.status == GameStatus.ACTIVE:
-        await message.answer(
-            "⚠️ У вас уже есть активная игра!\n"
-            "Завершите её перед началом новой."
-        )
-        return
-
-    await state.set_state(GameState.choosing_mode)
+@router.message(F.text == "😊 Как я себя чувствую")
+async def check_mood(message: Message, state: FSMContext):
+    """Проверка настроения"""
+    await state.set_state(MoodState.waiting_for_mood)
     await message.answer(
-        "🎮 **Выберите режим игры:**\n\n"
-        "⏱️ **Блиц** — больше слов за отведённое время\n"
-        "📝 **На очки** — игра до набора 1000 очков",
-        reply_markup=get_mode_keyboard(),
+        "💭 **Как ты себя чувствуешь сейчас?**\n\n"
+        "Оцени своё настроение от 1 до 7:\n\n"
+        "1 😢 — Очень плохо\n"
+        "2 😟 — Плохо\n"
+        "3 😐 — Нормально\n"
+        "4 🙂 — Хорошо\n"
+        "5 😊 — Очень хорошо\n"
+        "6 😄 — Отлично\n"
+        "7 🤩 — Прекрасно\n\n"
+        "Нажми на кнопку:",
+        reply_markup=get_mood_keyboard(),
         parse_mode="Markdown"
     )
 
 
-@router.message(F.text == "🤖 Игра с ботом")
-async def play_with_bot(message: Message, state: FSMContext):
-    """Игра с ботом"""
-    # Проверка активной игры
-    active_game = await db.get_active_game(message.from_user.id)
-    if active_game and active_game.status == GameStatus.ACTIVE:
-        await message.answer(
-            "⚠️ У вас уже есть активная игра!\n"
-            "Завершите её перед началом новой."
-        )
-        return
-
-    await state.set_state(GameState.choosing_time)
-    await message.answer(
-        "🤖 **Игра с ботом**\n\n"
-        "Выберите сложность и время:",
-        reply_markup=get_bot_difficulty_keyboard(),
+@router.callback_query(F.data.startswith("mood_"))
+async def mood_selected(callback: CallbackQuery, state: FSMContext):
+    """Выбрано настроение"""
+    mood = int(callback.data.split("_")[1])
+    await state.update_data(mood=mood)
+    await state.set_state(MoodState.waiting_for_note)
+    
+    emojis = ["😢", "😟", "😐", "🙂", "😊", "😄", "🤩"]
+    mood_names = ["Очень плохо", "Плохо", "Нормально", "Хорошо", "Очень хорошо", "Отлично", "Прекрасно"]
+    
+    await callback.message.answer(
+        f"Спасибо! Ты оценил(а) своё настроение как **{mood_names[mood-1]} {emojis[mood-1]}**\n\n"
+        "Хочешь добавить заметку? Напиши, что ты чувствуешь (или нажми /skip чтобы пропустить):",
         parse_mode="Markdown"
     )
 
 
-@router.message(F.text == "📊 Рейтинг")
-async def show_leaderboard(message: Message):
-    """Показать лидерборд"""
-    players = await db.get_leaderboard(10)
+@router.message(MoodState.waiting_for_note, F.text == "/skip")
+@router.message(MoodState.waiting_for_note, F.text == "❌ Пропустить")
+async def skip_note(message: Message, state: FSMContext):
+    """Пропустить заметку"""
+    data = await state.get_data()
+    mood = data.get("mood", 5)
+    user_id = message.from_user.id
     
-    text = "🏆 **Топ игроков**\n\n"
-    for i, player in enumerate(players, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        text += f"{medal} **{player.first_name}** — {player.rating} оч. "
-        text += f"({player.games_won}/{player.games_played})\n"
+    await db.add_mood(user_id, mood, "")
     
-    await message.answer(text, parse_mode="Markdown")
+    quote = get_quote_by_mood(mood)
+    
+    await message.answer(
+        f"✅ **Настроение записано!**\n\n"
+        f"💭 {quote['text']}\n"
+        f"_{quote['author']}_\n\n"
+        "Заходи завтра, чтобы снова отметить своё настроение! 💙",
+        parse_mode="Markdown"
+    )
+    await state.set_state(None)
+    await message.answer("Главное меню", reply_markup=get_main_keyboard())
 
 
-@router.message(F.text == "📈 Моя статистика")
+@router.message(MoodState.waiting_for_note)
+async def save_note(message: Message, state: FSMContext):
+    """Сохранить заметку"""
+    data = await state.get_data()
+    mood = data.get("mood", 5)
+    note = message.text
+    user_id = message.from_user.id
+    
+    await db.add_mood(user_id, mood, note)
+    
+    quote = get_quote_by_mood(mood)
+    
+    await message.answer(
+        f"✅ **Настроение и заметка записаны!**\n\n"
+        f"📝 _{note}_\n\n"
+        f"💭 {quote['text']}\n"
+        f"_{quote['author']}_\n\n"
+        "Заходи завтра, чтобы снова отметить своё настроение! 💙",
+        parse_mode="Markdown"
+    )
+    await state.set_state(None)
+    await message.answer("Главное меню", reply_markup=get_main_keyboard())
+
+
+@router.message(F.text == "📊 Статистика")
 async def show_stats(message: Message):
-    """Показать статистику игрока"""
-    player = await db.get_player_by_telegram_id(message.from_user.id)
+    """Показать статистику"""
+    user_id = message.from_user.id
+    stats = await db.get_mood_stats(user_id, days=7)
     
-    if not player:
-        await message.answer("❌ Игрок не найден")
+    if stats['count'] == 0:
+        await message.answer(
+            "📊 **Статистика**\n\n"
+            "Пока нет записей о настроении.\n"
+            "Начни отслеживать своё состояние! 💙",
+            parse_mode="Markdown"
+        )
         return
     
-    win_rate = (player.games_won / player.games_played * 100) if player.games_played > 0 else 0
+    mood_emoji = "😢" if stats['avg'] <= 3 else "😐" if stats['avg'] <= 5 else "😊"
     
     text = f"""
-📊 **Статистика: {player.first_name}**
+📊 **Твоя статистика за 7 дней** {mood_emoji}
 
-🏅 Рейтинг: {player.rating}
-🎮 Игр сыграно: {player.games_played}
-✅ Побед: {player.games_won}
-📈 Процент побед: {win_rate:.1f}%
+📈 Среднее настроение: **{stats['avg']}**
+📉 Минимальное: **{stats['min']}**
+📈 Максимальное: **{stats['max']}**
+📝 Всего записей: **{stats['count']}**
+
+💙 Продолжай отслеживать своё состояние!
 """
     await message.answer(text, parse_mode="Markdown")
+
+
+@router.message(F.text == "🧘 Упражнения")
+async def show_exercises(message: Message):
+    """Показать упражнения"""
+    await message.answer(
+        "🧘 **Дыхательные упражнения**\n\n"
+        "Выберите технику для расслабления:",
+        reply_markup=get_exercises_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("ex_"))
+async def show_exercise(callback: CallbackQuery):
+    """Показать упражнение"""
+    ex_id = callback.data.split("_")[1]
+    text = format_exercise(ex_id)
+    
+    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.message(F.text == "📝 Трекер привычек")
+async def show_habits(message: Message):
+    """Показать привычки"""
+    user_id = message.from_user.id
+    habits = await db.get_habits(user_id)
+    
+    if not habits:
+        await message.answer(
+            "📝 **Трекер привычек**\n\n"
+            "У тебя пока нет привычек. Давай добавим!\n\n"
+            "Нажми '➕ Добавить привычку' чтобы начать:",
+            reply_markup=get_habits_keyboard([]),
+            parse_mode="Markdown"
+        )
+        return
+    
+    text = "📝 **Твои привычки на сегодня**\n\n"
+    for i, habit in enumerate(habits, 1):
+        status = "✅" if habit.completed_today else "⬜"
+        text += f"{i}. {status} {habit.name}\n"
+    
+    await message.answer(
+        text + "\nНажми на привычку, чтобы отметить выполнение:",
+        reply_markup=get_habits_keyboard(habits),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "habit_add")
+async def add_habit_prompt(callback: CallbackQuery):
+    """Добавить привычку"""
+    await callback.message.answer(
+        "➕ **Новая привычка**\n\n"
+        "Напиши название привычки (например: 'Выпить 8 стаканов воды'):\n\n"
+        "Или нажми /cancel чтобы отменить",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("habit_"))
+async def toggle_habit(callback: CallbackQuery):
+    """Отметить привычку"""
+    habit_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    
+    habits = await db.get_habits(user_id)
+    habit = next((h for h in habits if h.id == habit_id), None)
+    
+    if not habit:
+        await callback.answer("❌ Привычка не найдена", show_alert=True)
+        return
+    
+    if habit.completed_today:
+        await db.uncomplete_habit(habit_id, user_id)
+        await callback.answer("❌ Отменено", show_alert=True)
+    else:
+        await db.complete_habit(habit_id, user_id)
+        await callback.answer("✅ Молодец! Так держать! 💙", show_alert=True)
+    
+    # Обновить список
+    habits = await db.get_habits(user_id)
+    await callback.message.edit_reply_markup(reply_markup=get_habits_keyboard(habits))
+
+
+@router.message(F.text == "💬 Поддержка")
+async def show_support(message: Message):
+    """Показать поддержку"""
+    await message.answer(
+        "💙 **Поддержка**\n\n"
+        "Я здесь, чтобы поддержать тебя. Выбери:",
+        reply_markup=get_support_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "support_message")
+async def send_support(callback: CallbackQuery):
+    """Отправить сообщение поддержки"""
+    msg = get_support_message()
+    await callback.message.answer(
+        f"🤗 {msg}\n\n"
+        "Помни: ты не один(на). Я всегда здесь, чтобы поддержать тебя! 💙",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "quote")
+async def send_quote(callback: CallbackQuery):
+    """Отправить цитату"""
+    quote = get_random_quote()
+    await callback.message.answer(
+        f"📖 **Цитата дня**\n\n"
+        f"_{quote['text']}_\n\n"
+        f"— {quote['author']}\n\n"
+        "💙 Возвращайся за новой порцией мотивации!",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "exercises")
+async def show_exercises_menu(callback: CallbackQuery):
+    """Показать меню упражнений"""
+    await callback.message.answer(
+        "🧘 **Дыхательные упражнения**\n\n"
+        "Выберите технику:",
+        reply_markup=get_exercises_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "back_menu")
+async def back_to_menu(callback: CallbackQuery):
+    """Вернуться в меню"""
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        "🏠 **Главное меню**\n\n"
+        "Выбери, что хочешь сделать:",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
 
 @router.message(F.text == "❓ Помощь")
@@ -285,776 +380,59 @@ async def show_help(message: Message):
     text = """
 ❓ **Помощь**
 
-🎮 **Как играть:**
-1. Найдите соперника или играйте с другом
-2. Составляйте слова из 7 букв
-3. Размещайте слова на поле 15x15
-4. Первое слово должно пройти через центр ★
+Я — бот психологической поддержки. Вот что я умею:
 
-📊 **Подсчёт очков:**
-• Каждая буква имеет стоимость (1-10 очков)
-• 🟩 x2 буква — удваивает стоимость буквы
-• 🟪 x3 буква — утраивает стоимость буквы  
-• 🟦 x2 слово — удваивает всё слово
-• 🟥 x3 слово — утраивает всё слово
+😊 **Как я себя чувствую**
+• Оцени своё настроение от 1 до 7
+• Добавь заметку о том, что чувствуешь
+• Получи цитату поддержки
 
-🏆 **Победа:**
-• В режиме "Блиц" — больше слов/очков за время
-• В режиме "На очки" — первым набрать 1000 очков
+📊 **Статистика**
+• Посмотри среднее настроение за неделю
+• Отслеживай динамику состояния
 
-💡 **Советы:**
-• Используйте длинные слова для больше очков
-• Ставьте буквы на премиум-клетки
-• Следите за временем в блице!
+🧘 **Упражнения**
+• Квадратное дыхание — от тревоги
+• Волна расслабления — перед сном
+• Заземление 5-4-3-2-1 — при панике
+• Энергетическое дыхание — для бодрости
+
+📝 **Трекер привычек**
+• Добавляй полезные привычки
+• Отмечай выполнение каждый день
+• Заботься о себе регулярно
+
+💬 **Поддержка**
+• Получи доброе сообщение
+• Прочитай мотивационную цитату
+• Сделай дыхательное упражнение
+
+💙 **Помни:**
+• Ты не один(на)
+• Ты важен(на)
+• Ты справишься
+• Просьба о помощи — это нормально
+
+**Экстренная помощь:**
+Если тебе очень плохо, обратись к специалисту:
+• Телефон доверия: 8-800-2000-122 (бесплатно)
+• МЧС психологическая помощь: +7 (495) 989-50-50
 """
     await message.answer(text, parse_mode="Markdown")
 
 
-# === Выбор режима ===
-
-@router.callback_query(F.data.startswith("mode_"))
-async def mode_selected(callback: CallbackQuery, state: FSMContext):
-    """Выбран режим игры"""
-    parts = callback.data.split("_")
-    mode_name = parts[1]
-    time_limit = int(parts[2]) if len(parts) > 2 else 0
-
-    mode_map = {
-        "time_words": GameMode.TIME_WORDS,
-        "time_points": GameMode.TIME_POINTS,
-        "points_only": GameMode.POINTS_ONLY
-    }
-
-    mode = mode_map.get(mode_name, GameMode.TIME_WORDS)
-
-    logger.info(f"Игрок {callback.from_user.id} выбрал режим: {mode_name}, время: {time_limit}")
-
-    # Сохраняем выбор в состоянии
-    await state.update_data(mode=mode.value, time_limit=time_limit)
-    await state.set_state(GameState.searching)
-
-    try:
-        await callback.message.edit_text(
-            "🔍 **Поиск соперника**\n\n"
-            "Выберите способ поиска:",
-            reply_markup=get_search_opponent_keyboard(),
-            parse_mode="Markdown"
-        )
-        logger.info(f"Отправлено сообщение с выбором поиска для {callback.from_user.id}")
-    except Exception as e:
-        logger.error(f"Ошибка при edit_text: {e}")
-        await callback.answer(f"Ошибка: {e}", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("bot_"))
-async def bot_difficulty_selected(callback: CallbackQuery, state: FSMContext):
-    """Выбрана сложность бота"""
-    parts = callback.data.split("_")
-    difficulty = parts[1]
-    time_limit = int(parts[2]) if len(parts) > 2 else 300
-
-    # Создаём игру с ботом
-    player = await db.get_or_create_player(
-        callback.from_user.id,
-        callback.from_user.username or "",
-        callback.from_user.first_name or "Игрок"
-    )
-
-    # Создаём "бота" как второго игрока
-    bot_player = await db.get_or_create_player(
-        telegram_id=999999999,  # Специальный ID для бота
-        username="erudit_bot",
-        first_name="🤖 Бот"
-    )
-
-    game = await db.create_game(
-        player.id,
-        bot_player.id,
-        GameMode.PLAYER_VS_BOT,
-        time_limit
-    )
-
-    # Генерируем начальные буквы
-    tiles1, tiles2 = generate_initial_tiles()
-    game.player1_tiles = "".join(tiles1)
-    game.player2_tiles = "".join(tiles2)
-    game.current_turn = player.telegram_id  # Игрок ходит первым
-    game.started_at = datetime.now().isoformat()
-
-    if time_limit > 0:
-        game.time_remaining = time_limit
-
-    await db.update_game(game)
-
-    # Сохраняем сложность бота в состоянии (для использования в ходах бота)
-    await state.update_data(
-        bot_difficulty=difficulty,
-        game_id=game.id
-    )
-    await state.set_state(GameState.playing)
-
-    await callback.message.edit_text(
-        f"🤖 **Игра с ботом началась!**\n\n"
-        f"Сложность: {difficulty}\n"
-        f"Ваш соперник: 🤖 Бот\n\n"
-        f"Ваши буквы: {' '.join(t.upper() for t in tiles1)}\n\n"
-        f"➡️ **Ваш ход!**",
-        reply_markup=get_game_keyboard(game, callback.from_user.id),
-        parse_mode="Markdown"
-    )
-
-
-# === Поиск соперника ===
-
-@router.callback_query(F.data == "search_random")
-async def search_random(callback: CallbackQuery, state: FSMContext):
-    """Поиск случайного соперника"""
-    data = await state.get_data()
-    mode = GameMode(data.get("mode", "time_words"))
-    time_limit = data.get("time_limit", 180)
-    
-    # Добавляем в очередь
-    await db.add_to_queue(callback.from_user.id, mode, time_limit)
-    
-    # Проверяем есть ли соперник
-    match = await db.find_match(callback.from_user.id)
-    
-    if match:
-        # Нашли соперника!
-        await db.remove_from_queue(callback.from_user.id)
-        await db.remove_from_queue(match["telegram_id"])
-        
-        # Создаём игру
-        player1 = await db.get_player_by_telegram_id(callback.from_user.id)
-        player2 = await db.get_player_by_telegram_id(match["telegram_id"])
-        
-        game = await db.create_game(player1.id, player2.id, mode, time_limit)
-        
-        # Генерируем начальные буквы
-        tiles1, tiles2 = generate_initial_tiles()
-        game.player1_tiles = "".join(tiles1)
-        game.player2_tiles = "".join(tiles2)
-        game.current_turn = player1.telegram_id
-        game.started_at = datetime.now().isoformat()
-        
-        if time_limit > 0:
-            game.time_remaining = time_limit
-        
-        await db.update_game(game)
-        
-        # Уведомляем обоих игроков
-        await callback.message.edit_text(
-            f"🎮 **Игра началась!**\n\n"
-            f"Ваш соперник: @{match['username'] or match['first_name']}\n\n"
-            f"Ваши буквы: {' '.join(t.upper() for t in tiles1)}\n\n"
-            f"{'➡️ Ваш ход!' if game.current_turn == callback.from_user.id else '⏳ Ход соперника'}",
-            reply_markup=get_game_keyboard(game, callback.from_user.id),
-            parse_mode="Markdown"
-        )
-        
-        # Отправляем уведомление сопернику
-        try:
-            await callback.bot.send_message(
-                match["telegram_id"],
-                f"🎮 **Игра началась!**\n\n"
-                f"Ваш соперник: @{callback.from_user.username or callback.from_user.first_name}\n\n"
-                f"Ваши буквы: {' '.join(t.upper() for t in tiles2)}\n\n"
-                f"{'➡️ Ваш ход!' if game.current_turn == match['telegram_id'] else '⏳ Ход соперника'}",
-                reply_markup=get_game_keyboard(game, match["telegram_id"]),
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить сообщение сопернику: {e}")
-    else:
-        await callback.message.edit_text(
-            "⏳ **Поиск соперника...**\n\n"
-            "Ожидаем подключения другого игрока.\n"
-            "Вы можете отменить поиск командой /cancel",
-            parse_mode="Markdown"
-        )
-
-
-@router.callback_query(F.data == "search_nickname")
-async def search_nickname(callback: CallbackQuery, state: FSMContext):
-    """Поиск по нику"""
-    await state.set_state(GameState.waiting_for_nickname)
-    await callback.message.edit_text(
-        "👤 **Поиск по нику**\n\n"
-        "Введите @username соперника:",
-        parse_mode="Markdown"
-    )
-
-
-@router.message(GameState.waiting_for_nickname)
-async def nickname_entered(message: Message, state: FSMContext):
-    """Введён ник соперника"""
-    username = message.text.strip().lstrip('@')
-    
-    opponent = await db.search_player_by_username(username)
-    
-    if not opponent:
-        await message.answer(
-            f"❌ Игрок @{username} не найден.\n"
-            "Попробуйте ещё раз или выберите другой способ поиска.",
-            reply_markup=get_search_opponent_keyboard()
-        )
-        return
-    
-    if opponent.telegram_id == message.from_user.id:
-        await message.answer(
-            "❌ Нельзя играть с самим собой!",
-            reply_markup=get_search_opponent_keyboard()
-        )
-        return
-    
-    # Проверяем активные игры
-    active_game = await db.get_active_game(opponent.telegram_id)
-    if active_game:
-        await message.answer(
-            f"❌ @{username} сейчас в игре.\n"
-            "Попробуйте позже или выберите другого соперника.",
-            reply_markup=get_search_opponent_keyboard()
-        )
-        return
-    
-    # Создаём игру
-    data = await state.get_data()
-    mode = GameMode(data.get("mode", "time_words"))
-    time_limit = data.get("time_limit", 180)
-    
-    player1 = await db.get_player_by_telegram_id(message.from_user.id)
-    player2 = opponent
-    
-    game = await db.create_game(player1.id, player2.id, mode, time_limit)
-    
-    tiles1, tiles2 = generate_initial_tiles()
-    game.player1_tiles = "".join(tiles1)
-    game.player2_tiles = "".join(tiles2)
-    game.current_turn = player1.telegram_id
-    game.started_at = datetime.now().isoformat()
-    
-    if time_limit > 0:
-        game.time_remaining = time_limit
-    
-    await db.update_game(game)
-    
-    await state.set_state(GameState.playing)
-    
+@router.message(Command("cancel"))
+async def cancel_command(message: Message, state: FSMContext):
+    """Отменить текущее действие"""
+    await state.set_state(None)
     await message.answer(
-        f"🎮 **Игра началась!**\n\n"
-        f"Ваш соперник: @{opponent.username or opponent.first_name}\n\n"
-        f"Ваши буквы: {' '.join(t.upper() for t in tiles1)}\n\n"
-        f"{'➡️ Ваш ход!' if game.current_turn == message.from_user.id else '⏳ Ход соперника'}",
-        reply_markup=get_game_keyboard(game, message.from_user.id),
-        parse_mode="Markdown"
-    )
-    
-    # Уведомляем соперника
-    try:
-        await message.bot.send_message(
-            opponent.telegram_id,
-            f"🎮 **Вас вызвали на игру!**\n\n"
-            f"Соперник: @{message.from_user.username or message.from_user.first_name}\n\n"
-            f"Ваши буквы: {' '.join(t.upper() for t in tiles2)}\n\n"
-            f"{'➡️ Ваш ход!' if game.current_turn == opponent.telegram_id else '⏳ Ход соперника'}",
-            reply_markup=get_game_keyboard(game, opponent.telegram_id),
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Не удалось отправить сообщение сопернику: {e}")
-
-
-@router.callback_query(F.data == "back_menu")
-async def back_to_menu(callback: CallbackQuery, state: FSMContext):
-    """Вернуться в меню"""
-    await state.set_state(GameState.menu)
-    await db.remove_from_queue(callback.from_user.id)
-    
-    await callback.message.edit_text(
-        "🏠 Главное меню",
+        "❌ Отменено",
         reply_markup=get_main_keyboard()
     )
 
 
-# === Игровой процесс ===
-
-@router.callback_query(F.data == "action_make_move")
-async def make_move(callback: CallbackQuery, state: FSMContext):
-    """Начать ход — выбор букв"""
-    game = await db.get_active_game(callback.from_user.id)
-    
-    if not game:
-        await callback.answer("❌ Активная игра не найдена", show_alert=True)
-        return
-    
-    if game.current_turn != callback.from_user.id:
-        await callback.answer("⏳ Сейчас не ваш ход!", show_alert=True)
-        return
-    
-    # Определяем чьи буквы показывать
-    player = await db.get_player_by_telegram_id(callback.from_user.id)
-    is_player1 = player.id == game.player1_id
-    tiles = list(game.player1_tiles if is_player1 else game.player2_tiles)
-    
-    await state.update_data(
-        game_id=game.id,
-        selected_tiles=[],
-        current_tiles=tiles
-    )
-    await state.set_state(GameState.placing_word)
-    
-    await callback.message.edit_text(
-        f"📝 **Ваш ход**\n\n"
-        f"Буквы: {' '.join(t.upper() for t in tiles)}\n\n"
-        "Выберите буквы для слова (в порядке составления):",
-        reply_markup=get_tiles_keyboard(tiles, "select_"),
-        parse_mode="Markdown"
-    )
-
-
-@router.callback_query(F.data.startswith("select_"))
-async def select_tile(callback: CallbackQuery, state: FSMContext):
-    """Выбор буквы для слова"""
-    data = callback.data.split("_")
-
-    if data[1] == "done":
-        # Завершили выбор — спрашиваем куда поставить
-        selected = await state.get_data()
-        tiles = selected.get("selected_tiles", [])
-
-        if not tiles:
-            await callback.answer("❌ Выберите хотя бы одну букву", show_alert=True)
-            return
-
-        word = "".join(t[1] for t in tiles)  # буква это второй элемент кортежа
-
-        await state.update_data(current_word=word)
-        await state.set_state(GameState.placing_word)
-        
-        try:
-            await callback.message.edit_text(
-                f"📝 Слово: **{word.upper()}**\n\n"
-                f"Введите координаты и направление:\n"
-                "Пример: `7 7 г` (строка, колонка, г=горизонтально/в=вертикально)\n\n"
-                "Или /cancel для отмены",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка edit_text в select_tile: {e}")
-            await callback.message.answer(
-                f"📝 Слово: **{word.upper()}**\n\n"
-                f"Введите координаты и направление:\n"
-                "Пример: `7 7 г` (строка, колонка, г=горизонтально/в=вертикально)\n\n"
-                "Или /cancel для отмены",
-                parse_mode="Markdown"
-            )
-        return
-    
-    if data[1] == "cancel":
-        await state.set_state(GameState.playing)
-        try:
-            await callback.message.edit_text(
-                "❌ Ход отменён",
-                reply_markup=get_game_keyboard(await db.get_active_game(callback.from_user.id), callback.from_user.id)
-            )
-        except Exception as e:
-            logger.error(f"Ошибка edit_text при cancel: {e}")
-            await callback.message.answer(
-                "❌ Ход отменён",
-                reply_markup=get_game_keyboard(await db.get_active_game(callback.from_user.id), callback.from_user.id)
-            )
-        return
-    
-    # Выбор буквы
-    idx = int(data[1])
-    letter = data[2]
-
-    state_data = await state.get_data()
-    selected = state_data.get("selected_tiles", [])
-    current_tiles = state_data.get("current_tiles", [])
-
-    # Удаляем выбранную букву из доступных
-    current_tiles.pop(idx)
-    selected.append((idx, letter))
-
-    await state.update_data(
-        selected_tiles=selected,
-        current_tiles=current_tiles
-    )
-
-    try:
-        await callback.message.edit_text(
-            f"📝 **Ваш ход**\n\n"
-            f"Буквы: {' '.join(t.upper() for t in [t[1] for t in selected])}\n"
-            f"Осталось: {' '.join(t.upper() for t in current_tiles) if current_tiles else 'ничего'}\n\n"
-            "Выбирайте ещё или нажмите ✅ Готово:",
-            reply_markup=get_tiles_keyboard(current_tiles, "select_"),
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка edit_text при выборе буквы: {e}")
-        await callback.message.answer(
-            f"📝 **Ваш ход**\n\n"
-            f"Буквы: {' '.join(t.upper() for t in [t[1] for t in selected])}\n"
-            f"Осталось: {' '.join(t.upper() for t in current_tiles) if current_tiles else 'ничего'}\n\n"
-            "Выбирайте ещё или нажмите ✅ Готово:",
-            reply_markup=get_tiles_keyboard(current_tiles, "select_"),
-            parse_mode="Markdown"
-        )
-
-
-@router.message(GameState.placing_word)
-async def place_word_input(message: Message, state: FSMContext):
-    """Ввод координат для размещения слова"""
-    if message.text.startswith('/'):
-        if message.text == "/cancel":
-            await state.set_state(GameState.playing)
-            await message.answer(
-                "❌ Ход отменён",
-                reply_markup=get_game_keyboard(await db.get_active_game(message.from_user.id), message.from_user.id)
-            )
-        return
-    
-    parts = message.text.lower().strip().split()
-    
-    if len(parts) != 3:
-        await message.answer(
-            "❌ Неверный формат.\n"
-            "Пример: `7 7 г` (строка, колонка, направление)\n"
-            "г = горизонтально, в = вертикально"
-        )
-        return
-    
-    try:
-        row = int(parts[0])
-        col = int(parts[1])
-        direction = parts[2]
-        
-        if not (0 <= row <= 14 and 0 <= col <= 14):
-            raise ValueError("Координаты вне поля")
-        
-        horizontal = direction in ('г', 'h', 'горизонтально')
-        
-    except (ValueError, IndexError) as e:
-        await message.answer(f"❌ Ошибка: {e}")
-        return
-    
-    # Получаем данные из состояния
-    state_data = await state.get_data()
-    game_id = state_data.get("game_id")
-    word = state_data.get("current_word", "").lower()
-    
-    if not word:
-        await message.answer("❌ Слово не выбрано")
-        return
-    
-    # Загружаем игру и поле
-    game = await db.get_game(game_id)
-    board = GameBoard.from_json(game.board)
-    bag = TileBag()  # Для реигры нужно сохранять состояние мешка
-    
-    # Определяем игрока
-    player = await db.get_player_by_telegram_id(message.from_user.id)
-    is_player1 = player.id == game.player1_id
-    tiles = list(game.player1_tiles if is_player1 else game.player2_tiles)
-    
-    # Первый ход?
-    is_first_move = game.player1_score == 0 and game.player2_score == 0
-    
-    # Проверяем размещение
-    placed = board.can_place_word(word, row, col, horizontal, tiles, is_first_move)
-    
-    if not placed:
-        await message.answer(
-            "❌ Нельзя разместить слово здесь.\n\n"
-            "Проверьте:\n"
-            "• Слово должно проходить через центр (первый ход)\n"
-            "• Все буквы должны быть на поле\n"
-            "• Смежные слова должны быть валидны"
-        )
-        return
-    
-    # Проверяем слово в словаре
-    word_exists = await db.check_word(word)
-    
-    if not word_exists:
-        # Для MVP позволяем любое слово (можно усилить проверку)
-        logger.info(f"Слово '{word}' не найдено в словаре, разрешаем для MVP")
-    
-    # Размещаем слово
-    board.place_word(placed)
-    
-    # Обновляем счёт
-    if is_player1:
-        game.player1_score += placed.points
-        game.player1_words += 1
-    else:
-        game.player2_score += placed.points
-        game.player2_words += 1
-    
-    # Обновляем буквы
-    new_tiles = list(tiles)
-    for _, _, letter in placed.new_letters:
-        if letter in new_tiles:
-            new_tiles.remove(letter)
-    
-    new_tiles = refill_tiles(bag, new_tiles)
-    
-    if is_player1:
-        game.player1_tiles = "".join(new_tiles)
-    else:
-        game.player2_tiles = "".join(new_tiles)
-    
-    # Сохраняем поле
-    game.board = board.to_json()
-    
-    # Добавляем ход в историю
-    await db.add_move(game.id, player.id, word, placed.points)
-    
-    # Передаём ход
-    opponent_id = game.player2_id if is_player1 else game.player1_id
-    opponent = await db.get_player_by_id(opponent_id)
-    game.current_turn = opponent.telegram_id
-    
-    # Проверяем окончание игры
-    winner = check_game_end(board, bag, 
-                           list(game.player1_tiles) if is_player1 else new_tiles,
-                           new_tiles if is_player1 else list(game.player2_tiles))
-    
-    if winner:
-        game.status = GameStatus.FINISHED
-        game.finished_at = datetime.now().isoformat()
-        game.winner_id = winner
-        # Обновляем рейтинг и статистику
-        # ...
-    
-    await db.update_game(game)
-    
-    await state.set_state(GameState.playing)
-    
-    # Показываем результат
-    board_preview = board.get_display()
-    preview_text = "   " + " ".join(f"{i:2}" for i in range(min(10, 15))) + "\n"
-    for i, row in enumerate(board_preview[:10]):
-        preview_text += f"{i:2} │" + " ".join(f"{c:2}" for c in row[:10]) + "│\n"
-    
-    await message.answer(
-        f"✅ **Слово размещено!**\n\n"
-        f"📝 {word.upper()} — {placed.points} оч.\n\n"
-        f"👤 Вы: {game.player1_score if is_player1 else game.player2_score} оч.\n"
-        f"👤 Соперник: {game.player2_score if is_player1 else game.player1_score} оч.\n\n"
-        f"{'🎉 Победа!' if winner and winner == (1 if is_player1 else 2) else '⏳ Ход соперника'}\n\n"
-        f"```\n{preview_text}\n```",
-        parse_mode="Markdown"
-    )
-    
-    # Уведомляем соперника
-    try:
-        await message.bot.send_message(
-            opponent.telegram_id,
-            f"📝 **Соперник сделал ход!**\n\n"
-            f"Слово: {word.upper()} ({placed.points} оч.)\n\n"
-            f"👤 Вы: {game.player2_score if is_player1 else game.player1_score} оч.\n"
-            f"👤 Соперник: {game.player1_score if is_player1 else game.player2_score} оч.\n\n"
-            f"➡️ **Ваш ход!**",
-            reply_markup=get_game_keyboard(game, opponent.telegram_id),
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Не удалось уведомить соперника: {e}")
-
-    # Если игра с ботом и сейчас ход бота - делаем ход бота
-    if game.mode == "player_vs_bot" and opponent.telegram_id == 999999999:
-        await asyncio.sleep(1.5)  # Небольшая задержка для естественности
-        await make_bot_move(message.bot, game, state)
-
-
-async def make_bot_move(bot: Bot, game: Game, state: FSMContext):
-    """Сделать ход бота"""
-    try:
-        # Получаем данные бота
-        state_data = await state.get_data()
-        difficulty = state_data.get("bot_difficulty", "medium")
-
-        # Создаём бота
-        bot_opponent = BotOpponent(difficulty)
-
-        # Загружаем слова из БД
-        cursor = await db._connection.execute("SELECT word FROM words")
-        rows = await cursor.fetchall()
-        words = [r[0] for r in rows]
-        bot_opponent.load_words(words)
-
-        # Получаем поле и буквы бота
-        board = GameBoard.from_json(game.board)
-        bot_tiles = list(game.player2_tiles)
-
-        # Первый ли ход (если у бота 0 очков и у игрока 0 очков)
-        is_first_move = game.player2_score == 0 and game.player1_score == 0
-
-        # Ищем лучший ход
-        placed = bot_opponent.find_best_move(bot_tiles, board, is_first_move)
-
-        if not placed:
-            # Бот не может сделать ход - пропускаем
-            await bot.send_message(
-                game.player1_id,
-                "🤖 **Бот пропускает ход**\n\n"
-                "Не нашёл подходящего слова.\n\n"
-                "➡️ **Ваш ход!**",
-                parse_mode="Markdown"
-            )
-
-            # Возвращаем ход игроку
-            game.current_turn = game.player1_id
-            await db.update_game(game)
-            return
-
-        # Размещаем слово
-        board.place_word(placed)
-
-        # Обновляем счёт бота
-        game.player2_score += placed.points
-        game.player2_words += 1
-
-        # Обновляем буквы бота
-        new_tiles = list(bot_tiles)
-        for _, _, letter in placed.new_letters:
-            if letter in new_tiles:
-                new_tiles.remove(letter)
-
-        bag = TileBag()
-        new_tiles = refill_tiles(bag, new_tiles)
-        game.player2_tiles = "".join(new_tiles)
-
-        # Сохраняем поле
-        game.board = board.to_json()
-
-        # Добавляем ход в историю
-        bot_player = await db.get_player_by_id(game.player2_id)
-        await db.add_move(game.id, bot_player.id, placed.word, placed.points)
-
-        # Проверяем окончание игры
-        winner = check_game_end(board, bag, list(game.player1_tiles), new_tiles)
-
-        if winner:
-            game.status = GameStatus.FINISHED
-            game.finished_at = datetime.now().isoformat()
-            game.winner_id = 1 if winner == 1 else 2
-
-        # Передаём ход игроку
-        game.current_turn = game.player1_id
-
-        await db.update_game(game)
-
-        # Отправляем результат игроку
-        await bot.send_message(
-            game.player1_id,
-            f"🤖 **Бот сделал ход!**\n\n"
-            f"Слово: **{placed.word.upper()}**\n"
-            f"Очки: {placed.points}\n\n"
-            f"👤 Вы: {game.player1_score} оч.\n"
-            f"🤖 Бот: {game.player2_score} оч.\n\n"
-            f"{'🎉 Победа!' if winner and winner == 1 else '➡️ Ваш ход!' if not winner else '🤖 Бот победил!'}",
-            reply_markup=get_game_keyboard(game, game.player1_id) if not winner else None,
-            parse_mode="Markdown"
-        )
-
-    except Exception as e:
-        logger.error(f"Ошибка при ходе бота: {e}")
-        # При ошибке просто передаём ход игроку
-        game.current_turn = game.player1_id
-        await db.update_game(game)
-
-
-@router.callback_query(F.data == "action_refresh")
-async def refresh_game(callback: CallbackQuery):
-    """Обновить состояние игры"""
-    game = await db.get_active_game(callback.from_user.id)
-    
-    if not game:
-        await callback.answer("❌ Игра не найдена", show_alert=True)
-        return
-    
-    player1 = await db.get_player_by_id(game.player1_id)
-    player2 = await db.get_player_by_id(game.player2_id)
-    
-    is_player1 = player1.telegram_id == callback.from_user.id
-    
-    tiles = list(game.player1_tiles if is_player1 else game.player2_tiles)
-    
-    text = get_game_status_text(game, player1, player2, callback.from_user.id)
-    text += f"\n\nВаши буквы: {' '.join(t.upper() for t in tiles)}"
-    
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_game_keyboard(game, callback.from_user.id),
-        parse_mode="Markdown"
-    )
-
-
-@router.callback_query(F.data == "action_surrender")
-async def surrender(callback: CallbackQuery):
-    """Сдаться"""
-    game = await db.get_active_game(callback.from_user.id)
-    
-    if not game:
-        await callback.answer("❌ Игра не найдена", show_alert=True)
-        return
-    
-    # Определяем победителя
-    player = await db.get_player_by_telegram_id(callback.from_user.id)
-    is_player1 = player.id == game.player1_id
-    winner_id = 2 if is_player1 else 1
-    
-    game.status = GameStatus.FINISHED
-    game.finished_at = datetime.now().isoformat()
-    game.winner_id = winner_id
-    await db.update_game(game)
-    
-    # Обновляем статистику
-    await db.update_stats(player.id, False)
-    
-    opponent_id = game.player2_id if is_player1 else game.player1_id
-    opponent = await db.get_player_by_id(opponent_id)
-    await db.update_stats(opponent.id, True)
-    
-    await callback.message.edit_text(
-        "🏳️ **Вы сдались**\n\n"
-        f"Победитель: @{opponent.username or opponent.first_name}",
-        parse_mode="Markdown"
-    )
-
-
-# === Таймер игры ===
-
-async def game_timer(bot: Bot):
-    """Фоновая задача для таймеров игр"""
-    while True:
-        try:
-            # Получаем все активные игры с таймером
-            # Для упрощения — проверяем раз в секунду
-            await asyncio.sleep(1)
-        except Exception as e:
-            logger.error(f"Ошибка в таймере: {e}")
-
-
-# === Запуск ===
-
-async def main():
-    """Точка входа"""
-    # Подключение к БД
-    await db.connect()
-    
-    # Инициализация бота
-    bot = Bot(token="YOUR_BOT_TOKEN")  # Заменить на токен из .env
-    dp = Dispatcher()
-    
-    dp.include_routers(main_router, game_router, search_router)
-    
-    # Запуск поллинга
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+@router.message(Command("skip"))
+async def skip_command(message: Message, state: FSMContext):
+    """Пропустить заметку"""
+    if await state.get_state() == MoodState.waiting_for_note:
+        await skip_note(message, state)
