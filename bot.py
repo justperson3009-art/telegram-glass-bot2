@@ -615,62 +615,92 @@ async def make_move(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("select_"))
 async def select_tile(callback: CallbackQuery, state: FSMContext):
     """Выбор буквы для слова"""
-    data = await callback.data.split("_")
-    
+    data = callback.data.split("_")
+
     if data[1] == "done":
         # Завершили выбор — спрашиваем куда поставить
         selected = await state.get_data()
         tiles = selected.get("selected_tiles", [])
-        
+
         if not tiles:
             await callback.answer("❌ Выберите хотя бы одну букву", show_alert=True)
             return
-        
+
         word = "".join(t[1] for t in tiles)  # буква это второй элемент кортежа
-        
+
         await state.update_data(current_word=word)
-        await callback.message.edit_text(
-            f"📝 Слово: **{word.upper()}**\n\n"
-            f"Введите координаты и направление:\n"
-            "Пример: `7 7 г` (строка, колонка, г=горизонтально/в=вертикально)\n\n"
-            "Или /cancel для отмены",
-            parse_mode="Markdown"
-        )
+        await state.set_state(GameState.placing_word)
+        
+        try:
+            await callback.message.edit_text(
+                f"📝 Слово: **{word.upper()}**\n\n"
+                f"Введите координаты и направление:\n"
+                "Пример: `7 7 г` (строка, колонка, г=горизонтально/в=вертикально)\n\n"
+                "Или /cancel для отмены",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка edit_text в select_tile: {e}")
+            await callback.message.answer(
+                f"📝 Слово: **{word.upper()}**\n\n"
+                f"Введите координаты и направление:\n"
+                "Пример: `7 7 г` (строка, колонка, г=горизонтально/в=вертикально)\n\n"
+                "Или /cancel для отмены",
+                parse_mode="Markdown"
+            )
         return
     
     if data[1] == "cancel":
         await state.set_state(GameState.playing)
-        await callback.message.edit_text(
-            "❌ Ход отменён",
-            reply_markup=get_game_keyboard(await db.get_active_game(callback.from_user.id), callback.from_user.id)
-        )
+        try:
+            await callback.message.edit_text(
+                "❌ Ход отменён",
+                reply_markup=get_game_keyboard(await db.get_active_game(callback.from_user.id), callback.from_user.id)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка edit_text при cancel: {e}")
+            await callback.message.answer(
+                "❌ Ход отменён",
+                reply_markup=get_game_keyboard(await db.get_active_game(callback.from_user.id), callback.from_user.id)
+            )
         return
     
     # Выбор буквы
     idx = int(data[1])
     letter = data[2]
-    
+
     state_data = await state.get_data()
     selected = state_data.get("selected_tiles", [])
     current_tiles = state_data.get("current_tiles", [])
-    
+
     # Удаляем выбранную букву из доступных
     current_tiles.pop(idx)
     selected.append((idx, letter))
-    
+
     await state.update_data(
         selected_tiles=selected,
         current_tiles=current_tiles
     )
-    
-    await callback.message.edit_text(
-        f"📝 **Ваш ход**\n\n"
-        f"Буквы: {' '.join(t.upper() for t in [t[1] for t in selected])}\n"
-        f"Осталось: {' '.join(t.upper() for t in current_tiles) if current_tiles else 'ничего'}\n\n"
-        "Выбирайте ещё или нажмите ✅ Готово:",
-        reply_markup=get_tiles_keyboard(current_tiles, "select_"),
-        parse_mode="Markdown"
-    )
+
+    try:
+        await callback.message.edit_text(
+            f"📝 **Ваш ход**\n\n"
+            f"Буквы: {' '.join(t.upper() for t in [t[1] for t in selected])}\n"
+            f"Осталось: {' '.join(t.upper() for t in current_tiles) if current_tiles else 'ничего'}\n\n"
+            "Выбирайте ещё или нажмите ✅ Готово:",
+            reply_markup=get_tiles_keyboard(current_tiles, "select_"),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка edit_text при выборе буквы: {e}")
+        await callback.message.answer(
+            f"📝 **Ваш ход**\n\n"
+            f"Буквы: {' '.join(t.upper() for t in [t[1] for t in selected])}\n"
+            f"Осталось: {' '.join(t.upper() for t in current_tiles) if current_tiles else 'ничего'}\n\n"
+            "Выбирайте ещё или нажмите ✅ Готово:",
+            reply_markup=get_tiles_keyboard(current_tiles, "select_"),
+            parse_mode="Markdown"
+        )
 
 
 @router.message(GameState.placing_word)
