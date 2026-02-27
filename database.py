@@ -437,32 +437,32 @@
      437             rating=row["rating"],
      438             games_played=row["games_played"],
      439             games_won=row["games_won"],
-                  created_at=row["created_at"]
-              )
-     
-          def _row_to_game(self, row: aiosqlite.Row) -> Game:
-              """Конвертировать строку в Game"""
-              return Game(
-                  id=row["id"],
-                  player1_id=row["player1_id"],
-                  player2_id=row["player2_id"],
-                  mode=GameMode(row["mode"]),
-                  status=GameStatus(row["status"]),
-                  board=row["board"] or "[]",
-                  current_turn=row["current_turn"],
-                  player1_tiles=row["player1_tiles"] or "",
-                  player2_tiles=row["player2_tiles"] or "",
-                  player1_score=row["player1_score"] or 0,
-                  player2_score=row["player2_score"] or 0,
-                  player1_words=row["player1_words"] or 0,
-                  player2_words=row["player2_words"] or 0,
-                  time_limit=row["time_limit"] or 0,
-                  time_remaining=row["time_remaining"] or 0,
-                  created_at=row["created_at"],
-                  started_at=row["started_at"],
-                  finished_at=row["finished_at"],
-                  winner_id=row["winner_id"]
-              )
-     
-     
-      db = Database()
+     440             created_at=row["created_at"]
+     441         )
+     442
+     443     def _row_to_game(self, row: aiosqlite.Row) -> Game:
+     444         """Конвертировать строку в Game"""
+     445         return Game(
+     446             id=row["id"],
+     447             player1_id=row["player1_id"],
+     448             player2_id=row["player2_id"],
+     449             mode=GameMode(row["mode"]),
+     450             status=GameStatus(row["status"]),
+     451             board=row["board"] or "[]",
+     452             current_turn=row["current_turn"],
+     453             player1_tiles=row["player1_tiles"] or "",
+     454             player2_tiles=row["player2_tiles"] or "",
+     455             player1_score=row["player1_score"] or 0,
+     456             player2_score=row["player2_score"] or 0,
+     457             player1_words=row["player1_words"] or 0,
+     458             player2_words=row["player2_words"] or 0,
+     459             time_limit=row["time_limit"] or 0,
+     460             time_remaining=row["time_remaining"] or 0,
+     461             created_at=row["created_at"],
+     462             started_at=row["started_at"],
+     463             finished_at=row["finished_at"],
+     464             winner_id=row["winner_id"]
+     465         )
+     466
+     467
+     468 db = Database()
